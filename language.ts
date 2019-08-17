@@ -40,7 +40,7 @@ function tokenize(source: string): Token[] {
   }
   // Repeatedly find the next token.
   const tokenTypes: { pattern: RegExp; type?: 'name' | 'ignore' | 'string' }[] = [
-    { pattern: /func/ },
+    { pattern: /func|var/ },
     { pattern: /"[^"\\]*"/, type: 'string' },
     { pattern: /[a-zA-Z]+/, type: 'name' },
     { pattern: /[\(\)\[\]\{\}.|@#,:&;]/ },
@@ -88,7 +88,9 @@ function tokenize(source: string): Token[] {
 
 const example = `
 
-print("Hello,");
+var hello = "Hello,";
+
+print(hello);
 print(" world!");
 
 `;
@@ -104,7 +106,8 @@ type Statement =
       is: 'expression';
       expression: Expression;
     }
-  | { is: 'return'; expression: Expression };
+  | { is: 'return'; expression: Expression }
+  | { is: 'var'; name: Token; expression: Expression };
 type Expression =
   | {
       is: 'call';
@@ -146,6 +149,15 @@ function parseBlockContents(r: TokenReader): Block {
 }
 
 function parseStatement(r: TokenReader): Statement {
+  const front = r.peek();
+  if (front && front.contents === 'var') {
+    r.advance();
+    const name = r.expect(token => token.type === 'name', 'variable name');
+    r.expect(token => token.contents === '=', "'=' following variable name");
+    const expression = parseExpression(r);
+    r.expect(token => token.contents === ';', "expected ';' after var initialization");
+    return { is: 'var', name, expression };
+  }
   const expression = parseExpression(r);
   r.expect(token => token.contents === ';', "expected ';' after statement");
   return { is: 'expression', expression };
@@ -241,7 +253,8 @@ type Operation =
   | { operation: 'discard' }
   | { operation: 'call'; arity: number }
   | { operation: 'return' }
-  | { operation: 'raise' };
+  | { operation: 'raise' }
+  | { operation: 'set-variable'; index: number };
 
 type Value =
   | { value: 'unit' }
@@ -281,6 +294,11 @@ function compileStatement(statement: Statement, context: Context): { code: Opera
     case 'return': {
       const result = compileExpression(statement.expression, context);
       return { ...result, code: result.code.concat({ operation: 'return' }) };
+    }
+    case 'var': {
+      const freeIndex = Object.keys(context.variableMapping).filter(v => context.variableMapping[v].is === 'var').length;
+      context.variableMapping[statement.name.contents] = { is: 'var', index: freeIndex };
+      return { code: compileExpression(statement.expression, context).code.concat([{ operation: 'set-variable', index: freeIndex }]) };
     }
   }
 }
@@ -392,9 +410,14 @@ function runProgram(globals: Record<string, Value>, code: Operation[]) {
         currentFrame.stack.push(value);
         break;
       }
-      case 'raise': {
-        throw new Error('raise is not yet implemented');
+      case 'set-variable': {
+        const value = currentFrame.stack.pop()!;
+        currentFrame.variables[operation.index] = value;
+        currentFrame.counter++;
+        break;
       }
+      default:
+        throw new Error(operation.operation + ' is not yet implemented');
     }
   }
 }
