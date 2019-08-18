@@ -86,18 +86,6 @@ function tokenize(source: string): Token[] {
   return tokens;
 }
 
-const example = `
-
-var hello = "Hello,";
-
-print(hello);
-print(" world!");
-
-`;
-
-const exampleTokens = tokenize(example);
-console.info('tokens:', exampleTokens);
-
 type Block = {
   statements: Statement[];
 };
@@ -115,7 +103,8 @@ type Expression =
       args: Expression[];
     }
   | { is: 'string'; string: Token }
-  | { is: 'name'; name: Token };
+  | { is: 'name'; name: Token }
+  | { is: 'func'; args: Token[]; body: Block };
 
 class TokenReader {
   constructor(public readonly tokens: Token[], public index: number) {}
@@ -148,6 +137,13 @@ function parseBlockContents(r: TokenReader): Block {
   return { statements };
 }
 
+function parseBlockBracketed(r: TokenReader): Block {
+  r.expect(token => token.contents === '{', 'an open bracket to open a block');
+  const body = parseBlockContents(r);
+  r.expect(token => token.contents === '}', 'a closing bracket to close a block');
+  return body;
+}
+
 function parseStatement(r: TokenReader): Statement {
   const front = r.peek();
   if (front && front.contents === 'var') {
@@ -167,6 +163,13 @@ function parseExpression(r: TokenReader): Expression {
   const token = r.peek();
   if (!token) {
     return r.fail('expected expression');
+  }
+  if (token.contents === 'func') {
+    r.advance();
+    r.expect(t => t.contents === '(', "open parenthesis following 'func' keyword");
+    r.expect(t => t.contents === ')', "close parenthesis following 'func' keyword");
+    const body = parseBlockBracketed(r);
+    return { is: 'func', args: [] /* TODO */, body };
   }
   if (token.type === 'string') {
     r.advance();
@@ -208,9 +211,6 @@ function parseExpressionTrail(root: Expression, r: TokenReader): Expression {
   return root;
 }
 
-const exampleParsed = parseBlockContents(new TokenReader(exampleTokens, 0));
-console.info('parsed:', JSON.stringify(exampleParsed, null, 2));
-
 // Without worrying about typing information, we can build a (very bad) stack-based VM.
 // The VM only needs to be complicated enough to compute basic expressions, BUT we also
 // need to support delimited (one-shot) continuations.
@@ -249,7 +249,8 @@ type Operation =
   | { operation: 'push-string'; value: string }
   | { operation: 'push-argument'; index: number }
   | { operation: 'push-variable'; index: number }
-  | { operation: 'push-global'; name: string }
+  | { operation: 'push-builtin'; name: string }
+  | { operation: 'push-function'; name: string; bound: number }
   | { operation: 'discard' }
   | { operation: 'call'; arity: number }
   | { operation: 'return' }
@@ -260,7 +261,7 @@ type Value =
   | { value: 'unit' }
   | { value: 'string'; string: string }
   | { value: 'builtin-function'; func: (args: Value[]) => Value }
-  | { value: 'user-function'; code: Operation[] };
+  | { value: 'user-function'; code: Operation[]; bound: Value[] };
 
 type Frame = {
   readonly arguments: readonly Value[];
@@ -273,43 +274,48 @@ type Frame = {
   returnTo: Frame | null;
 };
 
-type Context = {
-  variableMapping: Record<string, { is: 'var' | 'arg'; index: number } | { is: 'global' }>;
+type Emitter = {
+  /** `addFunc` returns the id of the created global function */
+  addFunc: (code: Operation[]) => string;
 };
 
-function compileBlock(block: Block, context: Context): { code: Operation[] } {
+type Context = {
+  variableMapping: Record<string, { is: 'var' | 'arg'; index: number } | { is: 'builtin' }>;
+};
+
+function compileBlock(block: Block, context: Context, emitter: Emitter): { code: Operation[] } {
   const code: Operation[] = [];
   for (const statement of block.statements) {
-    code.push(...compileStatement(statement, context).code);
+    code.push(...compileStatement(statement, context, emitter).code);
   }
   return { code };
 }
 
-function compileStatement(statement: Statement, context: Context): { code: Operation[] } {
+function compileStatement(statement: Statement, context: Context, emitter: Emitter): { code: Operation[] } {
   switch (statement.is) {
     case 'expression': {
-      const result = compileExpression(statement.expression, context);
+      const result = compileExpression(statement.expression, context, emitter);
       return { ...result, code: result.code.concat({ operation: 'discard' }) };
     }
     case 'return': {
-      const result = compileExpression(statement.expression, context);
+      const result = compileExpression(statement.expression, context, emitter);
       return { ...result, code: result.code.concat({ operation: 'return' }) };
     }
     case 'var': {
       const freeIndex = Object.keys(context.variableMapping).filter(v => context.variableMapping[v].is === 'var').length;
       context.variableMapping[statement.name.contents] = { is: 'var', index: freeIndex };
-      return { code: compileExpression(statement.expression, context).code.concat([{ operation: 'set-variable', index: freeIndex }]) };
+      return { code: compileExpression(statement.expression, context, emitter).code.concat([{ operation: 'set-variable', index: freeIndex }]) };
     }
   }
 }
 
-function compileExpression(expression: Expression, context: Context): { code: Operation[] } {
+function compileExpression(expression: Expression, context: Context, emitter: Emitter): { code: Operation[] } {
   switch (expression.is) {
     case 'string':
       return { code: [{ operation: 'push-string', value: JSON.parse(expression.string.contents) }] };
     case 'call':
       return {
-        code: compileExpression(expression.func, context).code.concat(...expression.args.map(arg => compileExpression(arg, context).code), [
+        code: compileExpression(expression.func, context, emitter).code.concat(...expression.args.map(arg => compileExpression(arg, context, emitter).code), [
           { operation: 'call', arity: expression.args.length },
         ]),
       };
@@ -327,15 +333,53 @@ function compileExpression(expression: Expression, context: Context): { code: Op
           code: [{ operation: 'push-argument', index: item.index }],
         };
       } else {
-        return { code: [{ operation: 'push-global', name: expression.name.contents }] };
+        return { code: [{ operation: 'push-builtin', name: expression.name.contents }] };
       }
+    case 'func': {
+      // TODO: only pass the values that are actually referred to.
+      const existing = Object.keys(context.variableMapping);
+      const subcontext: Context = { variableMapping: {} };
+      existing.forEach((name, index) => {
+        subcontext.variableMapping[name] = { is: 'arg', index };
+      });
+      expression.args.forEach((arg, index) => {
+        subcontext.variableMapping[arg.contents] = { is: 'arg', index: existing.length + index };
+      });
+      const body = compileBlock(expression.body, subcontext, emitter);
+      const funcName = emitter.addFunc(body.code);
+      const setup: Operation[] = existing.map<Operation>(
+        (name: string): Operation => {
+          const storage = context.variableMapping[name];
+          if (storage.is === 'var') {
+            return { operation: 'push-variable', index: storage.index };
+          }
+          if (storage.is === 'arg') {
+            return { operation: 'push-argument', index: storage.index };
+          }
+          return { operation: 'push-builtin', name };
+        },
+      );
+      return { code: setup.reverse().concat([{ operation: 'push-function', name: funcName, bound: existing.length }]) };
+    }
   }
 }
 
-const exampleCode = compileBlock(exampleParsed, { variableMapping: { print: { is: 'global' } } });
-console.log(JSON.stringify(exampleCode));
+function compileRoot(block: Block, rootContext: Context): { code: Operation[]; globals: Record<string, Operation[]> } {
+  let globalIndex = 0;
+  const globals: Record<string, Operation[]> = {};
+  const emitter: Emitter = {
+    addFunc: body => {
+      const name = `$func${globalIndex}`;
+      globals[name] = body;
+      globalIndex += 1;
+      return name;
+    },
+  };
+  const { code } = compileBlock(block, rootContext, emitter);
+  return { code, globals };
+}
 
-function runProgram(globals: Record<string, Value>, code: Operation[]) {
+function runProgram(builtins: Record<string, Value>, userFunctions: Record<string, Operation[]>, code: Operation[]) {
   let currentFrame: Frame = {
     arguments: [],
     variables: [],
@@ -353,6 +397,9 @@ function runProgram(globals: Record<string, Value>, code: Operation[]) {
         break;
       }
       case 'push-argument': {
+        if (operation.index >= currentFrame.arguments.length) {
+          throw new Error(`cannot push argument[${operation.index}] since only ${currentFrame.arguments.length} arguments have been passed.`);
+        }
         currentFrame.stack.push(currentFrame.arguments[operation.index]);
         currentFrame.counter++;
         break;
@@ -362,8 +409,21 @@ function runProgram(globals: Record<string, Value>, code: Operation[]) {
         currentFrame.counter++;
         break;
       }
-      case 'push-global': {
-        currentFrame.stack.push(globals[operation.name]);
+      case 'push-builtin': {
+        currentFrame.stack.push(builtins[operation.name]);
+        currentFrame.counter++;
+        break;
+      }
+      case 'push-function': {
+        const bound: Value[] = [];
+        for (let i = 0; i < operation.bound; i++) {
+          const boundValue = currentFrame.stack.pop();
+          if (!boundValue) {
+            throw new Error(`cannot extract bound value ${i} of ${operation.bound} since the stack is empty`);
+          }
+          bound.push(boundValue);
+        }
+        currentFrame.stack.push({ value: 'user-function', code: userFunctions[operation.name], bound });
         currentFrame.counter++;
         break;
       }
@@ -375,15 +435,22 @@ function runProgram(globals: Record<string, Value>, code: Operation[]) {
       case 'call': {
         const args: Value[] = [];
         for (let i = 0; i < operation.arity; i++) {
-          args.push(currentFrame.stack.pop()!);
+          const arg = currentFrame.stack.pop();
+          if (!arg) {
+            throw new Error(`expecting value to pop argument ${i + 1} of ${operation.arity} for call`);
+          }
+          args.push(arg);
         }
-        const func = currentFrame.stack.pop()!;
+        const func = currentFrame.stack.pop();
+        if (!func) {
+          throw new Error(`expecting function value with arity ${operation.arity}`);
+        }
         currentFrame.counter++; // For when it's resumed
         if (func.value === 'string') {
           throw new Error('cannot call string');
         }
         if (func.value === 'unit') {
-          throw new Error('cannot call unit');
+          throw new Error(`cannot call unit`);
         }
         if (func.value === 'builtin-function') {
           currentFrame.stack.push(func.func(args));
@@ -391,7 +458,7 @@ function runProgram(globals: Record<string, Value>, code: Operation[]) {
         }
         if (func.value === 'user-function') {
           currentFrame = {
-            arguments: args,
+            arguments: func.bound.concat(args),
             variables: [],
             code: func.code,
             counter: 0,
@@ -422,6 +489,26 @@ function runProgram(globals: Record<string, Value>, code: Operation[]) {
   }
 }
 
+const example = `
+var hello = "Hello,";
+
+var printThrice = func() {
+  print("!");
+  print("!");
+  print("!");
+};
+
+print(hello);
+print(" world");
+printThrice();
+`;
+
+const exampleTokens = tokenize(example);
+
+const exampleParsed = parseBlockContents(new TokenReader(exampleTokens, 0));
+
+const exampleCode = compileRoot(exampleParsed, { variableMapping: { print: { is: 'builtin' } } });
+
 runProgram(
   {
     print: {
@@ -432,5 +519,6 @@ runProgram(
       },
     },
   },
+  exampleCode.globals,
   exampleCode.code,
 );
