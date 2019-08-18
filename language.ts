@@ -167,9 +167,26 @@ function parseExpression(r: TokenReader): Expression {
   if (token.contents === 'func') {
     r.advance();
     r.expect(t => t.contents === '(', "open parenthesis following 'func' keyword");
+    const args: Token[] = [];
+    while (r.peek() && r.peek()!.contents !== ')') {
+      const name = r.expect(token => token.type === 'name', 'argument name');
+      args.push(name);
+      const next = r.peek();
+      if (!next) {
+        return r.fail('unexpected end of input inside argument list');
+      }
+      if (next.contents === ',') {
+        r.advance();
+        continue;
+      }
+      if (next.contents === ')') {
+        break;
+      }
+      return r.fail('expected argument');
+    }
     r.expect(t => t.contents === ')', "close parenthesis following 'func' keyword");
     const body = parseBlockBracketed(r);
-    return { is: 'func', args: [] /* TODO */, body };
+    return { is: 'func', args, body };
   }
   if (token.type === 'string') {
     r.advance();
@@ -246,6 +263,7 @@ function parseExpressionTrail(root: Expression, r: TokenReader): Expression {
 // Everything else will be achieved by function calls to built-ins, somehow.
 
 type Operation =
+  | { operation: 'push-nil' }
   | { operation: 'push-string'; value: string }
   | { operation: 'push-argument'; index: number }
   | { operation: 'push-variable'; index: number }
@@ -346,7 +364,7 @@ function compileExpression(expression: Expression, context: Context, emitter: Em
         subcontext.variableMapping[arg.contents] = { is: 'arg', index: existing.length + index };
       });
       const body = compileBlock(expression.body, subcontext, emitter);
-      const funcName = emitter.addFunc(body.code);
+      const funcName = emitter.addFunc(body.code.concat([{ operation: 'push-nil' }, { operation: 'return' }]));
       const setup: Operation[] = existing.map<Operation>(
         (name: string): Operation => {
           const storage = context.variableMapping[name];
@@ -391,6 +409,11 @@ function runProgram(builtins: Record<string, Value>, userFunctions: Record<strin
   while (currentFrame.counter < currentFrame.code.length) {
     const operation = currentFrame.code[currentFrame.counter];
     switch (operation.operation) {
+      case 'push-nil': {
+        currentFrame.stack.push({ value: 'unit' });
+        currentFrame.counter++;
+        break;
+      }
       case 'push-string': {
         currentFrame.stack.push({ value: 'string', string: operation.value });
         currentFrame.counter++;
@@ -492,15 +515,17 @@ function runProgram(builtins: Record<string, Value>, userFunctions: Record<strin
 const example = `
 var hello = "Hello,";
 
-var printThrice = func() {
-  print("!");
-  print("!");
-  print("!");
+var thrice = func(f) {
+  f();
+  f();
+  f();
 };
 
 print(hello);
 print(" world");
-printThrice();
+thrice(func() {
+  print("!");
+});
 `;
 
 const exampleTokens = tokenize(example);
