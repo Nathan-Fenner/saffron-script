@@ -95,7 +95,8 @@ type Statement =
       expression: Expression;
     }
   | { is: 'return'; expression: Expression }
-  | { is: 'var'; name: Token; expression: Expression };
+  | { is: 'var'; name: Token; expression: Expression }
+  | { is: 'assignment'; source: Expression; target: Expression };
 type Expression =
   | {
       is: 'call';
@@ -155,6 +156,13 @@ function parseStatement(r: TokenReader): Statement {
     return { is: 'var', name, expression };
   }
   const expression = parseExpression(r);
+  if (r.peek() && r.peek()!.contents === '=') {
+    r.advance();
+    const target = expression;
+    const source = parseExpression(r);
+    r.expect(token => token.contents === ';', "expected ';' after assignment");
+    return { is: 'assignment', source, target };
+  }
   r.expect(token => token.contents === ';', "expected ';' after statement");
   return { is: 'expression', expression };
 }
@@ -323,6 +331,18 @@ function compileStatement(statement: Statement, context: Context, emitter: Emitt
       const freeIndex = Object.keys(context.variableMapping).filter(v => context.variableMapping[v].is === 'var').length;
       context.variableMapping[statement.name.contents] = { is: 'var', index: freeIndex };
       return { code: compileExpression(statement.expression, context, emitter).code.concat([{ operation: 'set-variable', index: freeIndex }]) };
+    }
+    case 'assignment': {
+      if (statement.target.is !== 'name') {
+        throw new Error('cannot assign to non-named entity');
+      }
+      const target = context.variableMapping[statement.target.name.contents];
+      if (target.is === 'arg') {
+        throw new Error('cannot assign argument');
+      } else if (target.is === 'builtin') {
+        throw new Error('cannot assign builtin');
+      }
+      return { code: compileExpression(statement.source, context, emitter).code.concat([{ operation: 'set-variable', index: target.index }]) };
     }
   }
 }
@@ -514,7 +534,7 @@ function runProgram(builtins: Record<string, Value>, userFunctions: Record<strin
 
 const example = `
 var hello = "Hello,";
-
+hello = "Hi,";
 var thrice = func(f) {
   f();
   f();
