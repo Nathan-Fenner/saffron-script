@@ -16,7 +16,7 @@ type Span = {
   end: Location;
 };
 type Token = {
-  type: 'name' | 'string' | 'other';
+  type: 'name' | 'string' | 'number' | 'other';
   contents: string;
   span: Span;
 };
@@ -39,8 +39,9 @@ function tokenize(source: string): Token[] {
     locations.push({ line, column });
   }
   // Repeatedly find the next token.
-  const tokenTypes: { pattern: RegExp; type?: 'name' | 'ignore' | 'string' }[] = [
+  const tokenTypes: { pattern: RegExp; type?: 'name' | 'number' | 'ignore' | 'string' }[] = [
     { pattern: /func|var/ },
+    { pattern: /\d+/, type: 'number' },
     { pattern: /"[^"\\]*"/, type: 'string' },
     { pattern: /[a-zA-Z]+/, type: 'name' },
     { pattern: /[\(\)\[\]\{\}.|@#,:&;]/ },
@@ -104,6 +105,7 @@ type Expression =
       args: Expression[];
     }
   | { is: 'string'; string: Token }
+  | { is: 'number'; number: Token }
   | { is: 'name'; name: Token }
   | { is: 'func'; args: Token[]; body: Block };
 
@@ -200,6 +202,10 @@ function parseExpression(r: TokenReader): Expression {
     r.advance();
     return parseExpressionTrail({ is: 'string', string: token }, r);
   }
+  if (token.type === 'number') {
+    r.advance();
+    return parseExpressionTrail({ is: 'number', number: token }, r);
+  }
   if (token.type === 'name') {
     r.advance();
     return parseExpressionTrail({ is: 'name', name: token }, r);
@@ -273,6 +279,7 @@ function parseExpressionTrail(root: Expression, r: TokenReader): Expression {
 type Operation =
   | { operation: 'push-nil' }
   | { operation: 'push-string'; value: string }
+  | { operation: 'push-number'; value: number }
   | { operation: 'push-argument'; index: number }
   | { operation: 'push-variable'; index: number }
   | { operation: 'push-builtin'; name: string }
@@ -286,6 +293,7 @@ type Operation =
 type Value =
   | { value: 'unit' }
   | { value: 'string'; string: string }
+  | { value: 'number'; number: number }
   | { value: 'builtin-function'; func: (args: Value[]) => Value }
   | { value: 'user-function'; code: Operation[]; bound: Value[] };
 
@@ -351,6 +359,8 @@ function compileExpression(expression: Expression, context: Context, emitter: Em
   switch (expression.is) {
     case 'string':
       return { code: [{ operation: 'push-string', value: JSON.parse(expression.string.contents) }] };
+    case 'number':
+      return { code: [{ operation: 'push-number', value: JSON.parse(expression.number.contents) }] };
     case 'call':
       return {
         code: compileExpression(expression.func, context, emitter).code.concat(...expression.args.map(arg => compileExpression(arg, context, emitter).code), [
@@ -436,6 +446,11 @@ function runProgram(builtins: Record<string, Value>, userFunctions: Record<strin
       }
       case 'push-string': {
         currentFrame.stack.push({ value: 'string', string: operation.value });
+        currentFrame.counter++;
+        break;
+      }
+      case 'push-number': {
+        currentFrame.stack.push({ value: 'number', number: operation.value });
         currentFrame.counter++;
         break;
       }
@@ -536,15 +551,19 @@ const example = `
 var hello = "Hello,";
 hello = "Hi,";
 var thrice = func(f) {
-  f();
-  f();
-  f();
+  var count = 1;
+  f(count);
+  count = add(count, count);
+  f(count);
+  count = add(count, count);
+  f(count);
 };
 
 print(hello);
 print(" world");
-thrice(func() {
+thrice(func(c) {
   print("!");
+  print(c);
 });
 `;
 
@@ -552,7 +571,7 @@ const exampleTokens = tokenize(example);
 
 const exampleParsed = parseBlockContents(new TokenReader(exampleTokens, 0));
 
-const exampleCode = compileRoot(exampleParsed, { variableMapping: { print: { is: 'builtin' } } });
+const exampleCode = compileRoot(exampleParsed, { variableMapping: { print: { is: 'builtin' }, add: { is: 'builtin' } } });
 
 runProgram(
   {
@@ -561,6 +580,22 @@ runProgram(
       func: args => {
         console.info('print', args);
         return { value: 'unit' };
+      },
+    },
+    add: {
+      value: 'builtin-function',
+      func: args => {
+        if (args.length !== 2) {
+          throw new Error(`cannot add more/less than 2 values: ${JSON.stringify(args)}`);
+        }
+        const [arg1, arg2] = args;
+        if (arg1.value !== 'number') {
+          throw new Error(`cannot add non-number: ${JSON.stringify(args)}`);
+        }
+        if (arg2.value !== 'number') {
+          throw new Error(`cannot add non-number: ${JSON.stringify(args)}`);
+        }
+        return { value: 'number', number: arg1.number + arg2.number };
       },
     },
   },
